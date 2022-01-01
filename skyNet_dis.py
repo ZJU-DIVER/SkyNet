@@ -15,37 +15,38 @@ class SkyNet_Dis:
 
     def build_graph(self):
         if self.mode == 'train':
-            self.mode = tf.contrib.learn.ModeKeys.TRAIN
+            self.mode = tf.estimator.ModeKeys.TRAIN
         elif self.mode == 'infer':
-            self.mode = tf.contrib.learn.ModeKeys.INFER
+            self.mode = tf.estimator.ModeKeys.PREDICT
         elif self.mode == 'eval':
-            self.mode = tf.contrib.learn.ModeKeys.EVAL
+            self.mode = tf.estimator.ModeKeys.EVAL
         else:
             raise ValueError("Please choose mode: train, eval or infer")
-        tf.logging.info("Building {} model...".format(self.mode))
+        tf.compat.v1.logging.info("Building {} model...".format(self.mode))
 
-        self.src, self.src_length, self.trgt, self.src_real, self.trgt_real, self.src_real_length = self.iter
+        self.src, self.src_length, self.trgt, self.trgt_length = self.iter
         self.batch_size = tf.shape(self.src_length)[0]
         enc_outputs, enc_state = self._build_encoder()
         self.logits = self._build_decoder(enc_outputs, enc_state)
+
         self.p = tf.nn.sigmoid(self.logits)
 
     def _build_encoder(self):
-        dropout = self.params.dropout if self.mode == tf.contrib.learn.ModeKeys.TRAIN else 0.0
+        dropout = self.params.dropout if self.mode == tf.estimator.ModeKeys.TRAIN else 0.0
 
-        with tf.variable_scope("encoder") as scope:
-            cell = tf.contrib.rnn.LSTMBlockCell(self.params.num_units)
+        with tf.compat.v1.variable_scope("encoder") as scope:
+            cell = tf.compat.v1.nn.rnn_cell.LSTMCell(self.params.num_units)
 
             if dropout > 0.0:
-                cell = tf.contrib.rnn.DropoutWrapper(cell=cell, input_keep_prob=(1.0 - dropout))
+                cell = tf.compat.v1.nn.rnn_cell.DropoutWrapper(cell=cell, input_keep_prob=(1.0 - dropout))
 
-            enc_outputs, enc_state = tf.nn.dynamic_rnn(cell, self.src, sequence_length=self.src_length,
-                                                       dtype=tf.float32)
+            enc_outputs, enc_state = tf.compat.v1.nn.dynamic_rnn(cell, self.src, sequence_length=self.src_length,
+                                                                 dtype=tf.float32)
 
         return enc_outputs, enc_state
 
     def _build_decoder(self, enc_outputs, enc_state):
-        with tf.variable_scope("decoder") as decoder_scope:
+        with tf.compat.v1.variable_scope("decoder") as decoder_scope:
             cell, decoder_initial_state = self._build_decoder_cell(enc_outputs, enc_state, self.src_length)
 
             initial_inputs = tf.fill([self.batch_size, self.params.input_dim], 0.0)
@@ -58,7 +59,7 @@ class SkyNet_Dis:
         else:
             memory = enc_outputs
 
-        cell = tf.contrib.rnn.LSTMBlockCell(self.params.num_units)
+        cell = tf.compat.v1.nn.rnn_cell.LSTMCell(self.params.num_units)
 
         cell = Wrapper(cell, self.params.num_units, memory, memory_sequence_length=src_length, name="attention")
 
@@ -67,23 +68,32 @@ class SkyNet_Dis:
         return cell, decoder_initial_state
 
     def compute_loss(self):
-        distance = tf.pow(self.src_real, 2)
+
+        self.max_time = tf.shape(self.src)[1]
+
+        distance = tf.pow(self.src, 2)
         distance = tf.reduce_sum(distance, axis=-1)
-        scores = 1 / tf.pow(distance, 4)
-        max_time = tf.shape(self.src_real)[1]
-        base = tf.cast(max_time / 100, tf.float32)
-        scores = scores / (base + scores)
-        sky = tf.reduce_sum(tf.one_hot(self.trgt_real - 1, max_time, axis=-1, dtype=tf.float32), 1)
-        scores = tf.maximum(scores, sky)
+        scores = 1 / tf.pow(distance, 0.5)
+
+        zero = tf.zeros_like(scores)
+        scores = tf.where(tf.math.is_inf(scores), x=zero, y=scores)
+
+        base = tf.reduce_sum(scores, axis=-1)
+        base = tf.tile(tf.expand_dims(base, 1), [tf.constant(1), self.max_time])
+        scores = scores / base
+
+        self.multilabel = tf.reduce_sum(tf.one_hot(self.trgt, self.max_time + 1, axis=-1), 1)
+        self.multilabel = self.multilabel[:, 1:]  # get ride of index = 0 column
 
         p = tf.nn.sigmoid(self.logits)
-        p = p[:, 1:]
-        loss1 = -tf.log(p + 1e-10)
+        loss1 = -tf.compat.v1.log(p + 1e-10)
         loss1 = tf.multiply(loss1, scores)
-        loss2 = -tf.log(1 - p + 1e-10)
-        loss2 = tf.multiply(loss2, 1 - scores)
+        loss1 = tf.multiply(loss1, self.multilabel)
+        loss2 = -tf.compat.v1.log(1 - p + 1e-10)
+        loss2 = tf.multiply(loss2, scores)
+        loss2 = tf.multiply(loss2, 1 - self.multilabel)
         loss = loss1 + loss2
-        trgt_weight = tf.sequence_mask(self.src_real_length, max_time, dtype=self.logits.dtype)
-        self.loss = tf.reduce_sum(loss * trgt_weight) / tf.to_float(self.batch_size)
+        trgt_weight = tf.sequence_mask(self.src_length, self.max_time, dtype=self.logits.dtype)
+        self.loss = tf.reduce_sum(loss * trgt_weight) / tf.compat.v1.to_float(self.batch_size)
 
         return self.loss
